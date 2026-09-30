@@ -21,13 +21,11 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # 1. Checkout repo workflow (bisa repo kosong)
       - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
           path: workflow-repo
 
-      # 2. Clone proyek Flutter Code FA
       - name: Clone Code FA (Flutter project)
         run: |
           git clone --depth 1 ${{ env.CODE_LFA_REPO }} code_lfa
@@ -37,14 +35,12 @@ jobs:
           echo "=== Cek pubspec.yaml ==="
           test -f pubspec.yaml && echo "pubspec.yaml DITEMUKAN" || (echo "pubspec.yaml TIDAK ADA" && exit 1)
 
-      # 3. Setup Java
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
-      # 4. Setup Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -52,7 +48,6 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 5. Setup Android SDK (tanpa paket 'tools' usang)
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -60,7 +55,6 @@ jobs:
           accept-android-sdk-licenses: true
           packages: ''
 
-      # 6. Terima lisensi & instal paket yang benar
       - name: Accept Android SDK Licenses
         run: yes | sdkmanager --licenses || true
 
@@ -70,18 +64,21 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
-      # 7. HAPUS FILE LOCK USANG & INSTAL DEPENDENSI FLUTTER
+      # =========================================================
+      # LANGKAH KRUSIAL: Hapus pubspec.lock DAN pubspec_overrides.yaml
+      # =========================================================
       - name: Clean Flutter project and install dependencies
         working-directory: code_lfa
         run: |
-          echo "=== Menghapus pubspec.lock dan cache usang ==="
-          rm -f pubspec.lock .packages .flutter-plugins .flutter-plugins-dependencies
+          echo "=== Menghapus file usang yang berisi path absolut ==="
+          rm -f pubspec.lock pubspec_overrides.yaml .packages .flutter-plugins .flutter-plugins-dependencies
+          rm -rf .dart_tool build
+          echo "=== Menjalankan flutter clean ==="
           flutter clean
           flutter config --no-analytics
           echo "=== Menjalankan flutter pub get ==="
           flutter pub get
 
-      # 8. Download code-server dan letakkan di folder assets
       - name: Download code-server
         working-directory: code_lfa
         run: |
@@ -90,12 +87,10 @@ jobs:
             "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
           ls -la assets/code-server/
 
-      # 9. Build APK release
       - name: Build APK (release)
         working-directory: code_lfa
         run: flutter build apk --release --split-per-abi
 
-      # 10. Upload APK
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
