@@ -1,187 +1,1110 @@
+# .github/workflows/build.yaml
+#
+# VS Code (Electron) TIDAK bisa jalan native di Android. Karena itu APK ini memakai arsitektur:
+#   [APK Kotlin + WebView]  <-HTTP 127.0.0.1->  [VS Code Server (vscode-reh-web, build resmi dari source)]
+#                                                  dijalankan oleh Node.js versi Android (bionic, dari repo Termux)
+# Akal-akal supaya runtime Android tidak dikurangi:
+#   1. Node.js + ripgrep aarch64 bionic dari Termux, semua .so di-patchelf (rename + RUNPATH=$ORIGIN)
+#      lalu dimasukkan ke jniLibs -> boleh di-exec dari nativeLibraryDir (lolos aturan W^X Android 10+).
+#   2. Native module (node-pty/terminal, @parcel/watcher, spdlog, native-watchdog) di-compile ulang dgn Android NDK.
+#   3. process.platform "android" dipalsukan jadi "linux" (shim di bootstrap-node.js + --require) agar
+#      semua modul VS Code & ekstensi yang mengecek platform tetap jalan.
+#   4. Open VSX dipasang sebagai marketplace ekstensi.
+#   5. Foreground service + token koneksi acak (server hanya bind 127.0.0.1).
 name: Build VS Code Android APK
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      vscode_ref:
+        description: "Tag/branch/commit microsoft/vscode (kosong = release stabil terbaru)"
+        required: false
+        default: ""
+      publish_release:
+        description: "Upload APK ke GitHub Release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vscode-android-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  FLUTTER_VERSION: '3.27.4'
-  JAVA_VERSION: '17'
-  CODE_SERVER_VERSION: '4.103.1'
-  ANDROID_NDK_VERSION: '25.1.8937393'
-  CODE_LFA_REPO: 'https://github.com/nightmare-space/code_lfa.git'
+  TERMUX_REPO: https://packages.termux.dev/apt/termux-main
+  NDK_VERSION: "27.1.12297006"
 
 jobs:
-  build:
-    name: Build APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
+  # ------------------------------------------------------------------
+  # 1) Runtime Android: Node.js + ripgrep (Termux, bionic) + header node
+  # ------------------------------------------------------------------
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      vscode_ref: ${{ steps.ref.outputs.ref }}
+      node_major: ${{ steps.ref.outputs.node_major }}
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
-        with:
-          path: workflow-repo
-
-      - name: Clone Code FA
+      - name: Tentukan versi VS Code & versi Node yang dibutuhkan
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.vscode_ref }}
         run: |
-          git clone --depth 1 ${{ env.CODE_LFA_REPO }} code_lfa
-          cd code_lfa
-          test -f pubspec.yaml || { echo "FATAL: pubspec.yaml tidak ada"; exit 1; }
-          echo "OK: proyek Code FA ter-clone"
-
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: 'stable'
-          cache: true
-
-      - name: Verify Flutter and Dart
-        run: |
-          flutter --version
-          dart --version
-          flutter config --no-analytics
-          flutter config --no-cli-animations
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: '11076708'
-          accept-android-sdk-licenses: true
-          packages: ''
-
-      - name: Accept Android SDK Licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Install Android SDK Packages
-        run: |
-          set -e
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.ANDROID_NDK_VERSION }}"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
-
-      - name: Clean stale files
-        working-directory: code_lfa
-        run: |
-          rm -f pubspec.lock pubspec_overrides.yaml .packages .flutter-plugins .flutter-plugins-dependencies
-          rm -rf .dart_tool build
-          echo "OK: file usang dibersihkan"
-
-      # ── PERBAIKAN UTAMA: paksa path ke 1.9.0 ───────────────────────
-      - name: Patch pubspec.yaml to override path version
-        working-directory: code_lfa
-        run: |
-          echo "=== Sebelum patch: cek dependency_overrides ==="
-          grep -n "dependency_overrides" pubspec.yaml || echo "Tidak ada dependency_overrides"
-          echo "=== Menambahkan dependency_overrides: path: 1.9.0 ==="
-          # Hapus dependency_overrides lama jika ada (untuk aman)
-          sed -i '/^dependency_overrides:/,/^[^ ]/d' pubspec.yaml || true
-          # Tambahkan di akhir file
-          printf "\ndependency_overrides:\n  path: 1.9.0\n" >> pubspec.yaml
-          echo "=== Sesudah patch ==="
-          tail -20 pubspec.yaml
-
-      - name: Flutter pub get
-        working-directory: code_lfa
-        run: |
-          set -e
-          flutter clean
-          flutter pub get
-          test -f .dart_tool/package_config.json || { echo "FATAL: package_config.json tidak dibuat"; exit 1; }
-          echo "OK: dependensi ter-resolve"
-
-      - name: Download code-server
-        working-directory: code_lfa
-        run: |
-          set -e
-          mkdir -p assets/code-server
-          curl -fL --retry 3 --retry-delay 5 \
-            -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
-            "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
-          test -s assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz || { echo "FATAL: code-server tidak terunduh"; exit 1; }
-          echo "OK: code-server terunduh"
-
-      - name: Build APK (release, split-per-abi)
-        id: build_release
-        working-directory: code_lfa
-        continue-on-error: true
-        run: flutter build apk --release --split-per-abi
-
-      - name: Build APK (release, universal) - fallback
-        id: build_universal
-        if: steps.build_release.outcome == 'failure'
-        working-directory: code_lfa
-        continue-on-error: true
-        run: |
-          echo "Release split gagal, coba universal..."
-          flutter build apk --release
-
-      - name: Build APK (debug) - fallback
-        id: build_debug
-        if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure'
-        working-directory: code_lfa
-        continue-on-error: true
-        run: |
-          echo "Release universal gagal, coba debug..."
-          flutter build apk --debug
-
-      - name: Diagnose build failure
-        if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure' && steps.build_debug.outcome == 'failure'
-        working-directory: code_lfa
-        run: |
-          echo "=========================================="
-          echo "SEMUA BUILD GAGAL - DIAGNOSTIK"
-          echo "=========================================="
-          flutter doctor -v || true
-          echo "--- pubspec.yaml (tail) ---"
-          tail -30 pubspec.yaml || true
-          echo "--- Android SDK ---"
-          ls -la $ANDROID_HOME/ || true
-          echo "--- Struktur folder build ---"
-          find build -maxdepth 4 -type d 2>/dev/null || echo "Tidak ada folder build/"
-          echo "--- File APK ---"
-          find build -name "*.apk" 2>/dev/null || echo "Tidak ada APK"
-
-      - name: Verify APK exists
-        working-directory: code_lfa
-        run: |
-          APK_COUNT=$(find build/app/outputs -name "*.apk" 2>/dev/null | wc -l)
-          echo "Jumlah APK ditemukan: $APK_COUNT"
-          find build/app/outputs -name "*.apk" -exec ls -lh {} \; 2>/dev/null || true
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "FATAL: Tidak ada APK yang dihasilkan."
-            exit 1
+          set -euo pipefail
+          REF="$INPUT_REF"
+          if [ -z "$REF" ]; then
+            REF="$(gh api repos/microsoft/vscode/releases/latest --jq .tag_name)"
           fi
-          echo "OK: APK ditemukan"
+          NVM="$(curl -fsSL "https://raw.githubusercontent.com/microsoft/vscode/$REF/.nvmrc" | tr -d 'v \r\n')"
+          echo "VS Code ref : $REF"
+          echo "Node (.nvmrc): $NVM"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "node_major=${NVM%%.*}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload APK artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Install patchelf
+        run: sudo apt-get update && sudo apt-get install -y patchelf binutils
+
+      - name: Ambil Node.js & ripgrep dari Termux, patch ELF untuk APK
+        env:
+          NODE_MAJOR: ${{ steps.ref.outputs.node_major }}
+        run: |
+          set -euo pipefail
+          cat > termux_runtime.py <<'PY'
+          import gzip, lzma, os, re, shutil, subprocess, sys, pathlib, urllib.request
+
+          REPO = os.environ["TERMUX_REPO"]
+          MAJOR = os.environ["NODE_MAJOR"]
+          OUT = pathlib.Path("runtime-out/jniLibs/arm64-v8a")
+          HDR = pathlib.Path("runtime-out/node-headers")
+          WORK = pathlib.Path("termux-work")
+          ROOT = WORK / "root"
+          DEBS = WORK / "debs"
+          for d in (OUT, HDR, ROOT, DEBS):
+              d.mkdir(parents=True, exist_ok=True)
+
+          def fetch(url):
+              last = None
+              for _ in range(4):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "ci"})
+                      with urllib.request.urlopen(req, timeout=180) as r:
+                          return r.read()
+                  except Exception as e:
+                      last = e
+              raise last
+
+          raw = None
+          for suffix, fn in (("Packages.xz", lzma.decompress), ("Packages.gz", gzip.decompress), ("Packages", lambda b: b)):
+              try:
+                  raw = fn(fetch(f"{REPO}/dists/stable/main/binary-aarch64/{suffix}")).decode()
+                  break
+              except Exception as e:
+                  print("index gagal:", suffix, e)
+          if raw is None:
+              sys.exit("Tidak bisa mengambil index paket Termux")
+
+          pkgs = {}
+          for block in raw.split("\n\n"):
+              f = {}
+              for line in block.splitlines():
+                  if line and not line[0].isspace() and ":" in line:
+                      k, v = line.split(":", 1)
+                      f[k.strip()] = v.strip()
+              if "Package" in f:
+                  pkgs[f["Package"]] = f
+
+          def major(v):
+              m = re.match(r"(?:\d+:)?(\d+)\.", v)
+              return m.group(1) if m else None
+
+          node_pkg = None
+          for cand in ("nodejs-lts", "nodejs"):
+              if cand in pkgs and major(pkgs[cand]["Version"]) == MAJOR:
+                  node_pkg = cand
+                  break
+          if node_pkg is None:
+              node_pkg = "nodejs-lts" if "nodejs-lts" in pkgs else "nodejs"
+              print(f"::warning::Termux tidak punya Node {MAJOR}; memakai {node_pkg} {pkgs[node_pkg]['Version']}")
+          if "ripgrep" not in pkgs:
+              sys.exit("Paket ripgrep tidak ada di Termux")
+          print("Node package:", node_pkg, pkgs[node_pkg]["Version"])
+
+          def dep_names(p):
+              for part in pkgs[p].get("Depends", "").split(","):
+                  alt = part.split("|")[0]
+                  n = re.sub(r"\(.*?\)", "", alt).strip()
+                  if n:
+                      yield n
+
+          need, stack = [], [node_pkg, "ripgrep"]
+          while stack:
+              p = stack.pop()
+              if p in need or p.startswith("termux-"):
+                  continue
+              if p not in pkgs:
+                  print("lewati (tak ada di index):", p)
+                  continue
+              need.append(p)
+              stack.extend(dep_names(p))
+          print("Paket:", need)
+
+          for p in need:
+              fn = pkgs[p]["Filename"]
+              deb = DEBS / os.path.basename(fn)
+              deb.write_bytes(fetch(f"{REPO}/{fn}"))
+              subprocess.check_call(["dpkg-deb", "-x", str(deb), str(ROOT)])
+
+          PFX = ROOT / "data/data/com.termux/files/usr"
+          LIBDIR = PFX / "lib"
+          SYSTEM = {"libc.so", "libm.so", "libdl.so", "liblog.so", "libandroid.so", "libz.so", "libstdc++.so",
+                    "libEGL.so", "libGLESv2.so", "libvulkan.so", "libOpenSLES.so", "libjnigraphics.so",
+                    "libmediandk.so", "libnativewindow.so", "libbinder_ndk.so", "libaaudio.so"}
+
+          def needed(p):
+              return subprocess.check_output(["patchelf", "--print-needed", str(p)], text=True).split()
+
+          def newname(old):
+              if re.fullmatch(r"lib[^/]+\.so", old):
+                  return old
+              m = re.fullmatch(r"(lib.+?)\.so\.(.+)", old)
+              if not m:
+                  raise SystemExit(f"Nama library tak dikenal: {old}")
+              return f"{m.group(1)}_{m.group(2).replace('.', '_')}.so"
+
+          bins = {"libvscode_node.so": (PFX / "bin/node").resolve(), "libvscode_rg.so": (PFX / "bin/rg").resolve()}
+          for nm, src in bins.items():
+              if not src.exists():
+                  sys.exit(f"Binary tidak ditemukan: {src}")
+
+          done, todo = {}, []
+
+          def enqueue(path):
+              for n in needed(path):
+                  if n in SYSTEM or n in done:
+                      continue
+                  cand = LIBDIR / n
+                  if not cand.exists():
+                      print("dianggap library sistem:", n)
+                      continue
+                  done[n] = cand.resolve()
+                  todo.append(n)
+
+          for nm, src in bins.items():
+              shutil.copy2(src, OUT / nm)
+              enqueue(src)
+          while todo:
+              n = todo.pop()
+              shutil.copy2(done[n], OUT / newname(n))
+              enqueue(done[n])
+
+          mapping = {o: newname(o) for o in done if newname(o) != o}
+          for f in sorted(OUT.iterdir()):
+              os.chmod(f, 0o755)
+              args = ["patchelf", "--set-rpath", "$ORIGIN"]
+              cur = set(needed(f))
+              for o, n in mapping.items():
+                  if o in cur:
+                      args += ["--replace-needed", o, n]
+              if f.name not in bins:
+                  args += ["--set-soname", f.name]
+              subprocess.check_call(args + [str(f)])
+
+          have = {f.name for f in OUT.iterdir()}
+          for f in sorted(OUT.iterdir()):
+              for n in needed(f):
+                  if n not in have and n not in SYSTEM:
+                      print(f"::warning::{f.name} butuh {n} (asumsi library sistem Android)")
+          print("Total file:", len(have))
+
+          if (PFX / "include/node/node.h").exists():
+              shutil.copytree(PFX / "include/node", HDR / "include/node", dirs_exist_ok=True)
+          else:
+              ver = re.sub(r"^\d+:", "", pkgs[node_pkg]["Version"]).split("-")[0]
+              tgz = WORK / "headers.tgz"
+              tgz.write_bytes(fetch(f"https://nodejs.org/dist/v{ver}/node-v{ver}-headers.tar.gz"))
+              subprocess.check_call(["tar", "xzf", str(tgz), "-C", str(HDR), "--strip-components=1"])
+          assert (HDR / "include/node/node.h").exists(), "header node tidak ada"
+          PY
+          python3 termux_runtime.py
+          ls -la runtime-out/jniLibs/arm64-v8a
+          du -sh runtime-out/jniLibs/arm64-v8a
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: vscode-android-apk
-          path: |
-            code_lfa/build/app/outputs/flutter-apk/*.apk
-            code_lfa/build/app/outputs/apk/**/*.apk
-          retention-days: 30
+          name: android-runtime
+          path: runtime-out/jniLibs/arm64-v8a
+          if-no-files-found: error
+          compression-level: 6
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-headers
+          path: runtime-out/node-headers
           if-no-files-found: error
 
-      - name: Upload build logs (jika gagal)
-        if: failure()
-        uses: actions/upload-artifact@v4
+  # ------------------------------------------------------------------
+  # 2) Build VS Code Server (web) dari source + native module Android
+  # ------------------------------------------------------------------
+  server:
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+    env:
+      OUT: vscode-reh-web-linux-x64
+    steps:
+      - name: Bersihkan disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/checkout@v4
         with:
-          name: build-logs
-          path: |
-            code_lfa/android/.gradle/**
-            code_lfa/build/**
-          retention-days: 7
-          if-no-files-found: ignore
+          repository: microsoft/vscode
+          ref: ${{ needs.runtime.outputs.vscode_ref }}
+          path: vscode
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscode/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dependency sistem
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libkrb5-dev libx11-dev libxkbfile-dev libsecret-1-dev zip file
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: node-headers
+          path: node-headers
+
+      - name: npm ci (VS Code)
+        working-directory: vscode
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+          npm_config_arch: x64
+          GITHUB_TOKEN: ${{ github.token }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do npm ci && break || { echo "npm ci gagal (percobaan $i)"; [ "$i" = 3 ] && exit 1; sleep 20; }; done
+
+      - name: Build vscode-reh-web (server + web client)
+        working-directory: vscode
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          set -euo pipefail
+          npm run gulp vscode-reh-web-linux-x64-min
+          test -f "../$OUT/out/server-main.js" || { echo "::error::server-main.js tidak ditemukan"; ls ..; exit 1; }
+
+      - name: Compile ulang native module untuk Android (NDK, best-effort)
+        run: |
+          set -uo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+            NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          fi
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$BIN/aarch64-linux-android26-clang" CXX="$BIN/aarch64-linux-android26-clang++"
+          export AR="$BIN/llvm-ar" RANLIB="$BIN/llvm-ranlib" LINK="$BIN/aarch64-linux-android26-clang++"
+          export CXXFLAGS="-fPIC -Wno-deprecated-declarations" CFLAGS="-fPIC"
+          npm install -g node-gyp@11
+          MODS=(node-pty @parcel/watcher @vscode/spdlog native-watchdog)
+          for m in "${MODS[@]}"; do
+            d="vscode/remote/node_modules/$m"
+            if [ ! -f "$d/binding.gyp" ]; then echo "::warning::$m tidak ada/tanpa binding.gyp"; continue; fi
+            ( cd "$d" \
+              && sed -i -E "s/[\"']-lutil[\"'],?//g" binding.gyp \
+              && rm -rf build \
+              && node-gyp rebuild --arch=arm64 --nodedir="$GITHUB_WORKSPACE/node-headers" ) \
+              && echo "rebuild OK: $m" || echo "::warning::rebuild $m gagal"
+          done
+          mkdir -p android-natives
+          for m in "${MODS[@]}"; do
+            for f in vscode/remote/node_modules/$m/build/Release/*.node; do
+              [ -e "$f" ] || continue
+              if file "$f" | grep -q "ARM aarch64"; then
+                mkdir -p "android-natives/$m"; cp "$f" "android-natives/$m/"; echo "native aarch64: $m/$(basename "$f")"
+              else
+                echo "::warning::$f bukan aarch64"
+              fi
+            done
+          done
+          exit 0
+
+      - name: Patch server untuk Android
+        id: pack
+        run: |
+          set -euo pipefail
+          # buang biner glibc/x64 yang tidak bisa jalan di Android
+          rm -rf "$OUT/node" "$OUT/bin"
+          find "$OUT" -name '*.node' -delete
+          find "$OUT" -type d -name prebuilds -prune -exec rm -rf {} +
+          find "$OUT" -name '*.pdb' -delete
+          rm -f "$OUT/node_modules/@vscode/ripgrep/bin/rg"
+          # pasang native module hasil NDK
+          if [ -d android-natives ]; then
+            (cd android-natives && find . -name '*.node') | while read -r f; do
+              rel="$(dirname "$f")"
+              mkdir -p "$OUT/node_modules/$rel/build/Release"
+              cp "android-natives/$f" "$OUT/node_modules/$rel/build/Release/"
+            done
+          fi
+          # shim platform android -> linux
+          cat > "$OUT/android-preload.js" <<'JS'
+          try {
+            Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+            const os = process.getBuiltinModule ? process.getBuiltinModule('node:os') : require('os');
+            os.platform = () => 'linux';
+          } catch (e) { /* abaikan */ }
+          JS
+          SHIM="try{Object.defineProperty(process,'platform',{value:'linux',configurable:true});const __o=process.getBuiltinModule?process.getBuiltinModule('node:os'):null;if(__o)__o.platform=()=>'linux';}catch(e){}"
+          BN="$OUT/out/bootstrap-node.js"
+          test -f "$BN" || { echo "::error::$BN tidak ada"; exit 1; }
+          { printf '%s\n' "$SHIM"; cat "$BN"; } > "$BN.tmp" && mv "$BN.tmp" "$BN"
+          # marketplace: Open VSX
+          node -e '
+            const fs=require("fs"); const f=process.argv[1];
+            const p=JSON.parse(fs.readFileSync(f,"utf8"));
+            p.extensionsGallery={
+              serviceUrl:"https://open-vsx.org/vscode/gallery",
+              itemUrl:"https://open-vsx.org/vscode/item",
+              resourceUrlTemplate:"https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+              extensionUrlTemplate:"https://open-vsx.org/vscode/gallery/{publisher}/{name}/latest",
+              controlUrl:"", nlsBaseUrl:"", publisherUrl:""
+            };
+            fs.writeFileSync(f, JSON.stringify(p,null,2));
+          ' "$OUT/product.json"
+          VERSION="$(node -p "require('./$OUT/package.json').version")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          find "$OUT" -xtype l -delete
+          (cd "$OUT" && zip -qr9 -X ../vscode-server.zip .)
+          ls -lh vscode-server.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode-server
+          path: vscode-server.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  # ------------------------------------------------------------------
+  # 3) Rakit APK (Kotlin + WebView + foreground service)
+  # ------------------------------------------------------------------
+  apk:
+    needs: [runtime, server]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" >/dev/null
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-runtime
+          path: apk/app/src/main/jniLibs/arm64-v8a
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vscode-server
+          path: apk/app/src/main/assets
+
+      - name: Generate proyek Android
+        run: |
+          set -euo pipefail
+          test -f apk/app/src/main/jniLibs/arm64-v8a/libvscode_node.so
+          test -f apk/app/src/main/jniLibs/arm64-v8a/libvscode_rg.so
+          test -f apk/app/src/main/assets/vscode-server.zip
+          cd apk
+          P=app/src/main
+          mkdir -p $P/java/dev/vscode/android $P/res/xml $P/res/drawable
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "vscode-android"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.6.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "dev.vscode.android"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "dev.vscode.android"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = (System.getenv("APP_VERSION_CODE") ?: "1").toInt()
+                  versionName = System.getenv("APP_VERSION") ?: "1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+              signingConfigs {
+                  create("rel") {
+                      storeFile = file(System.getenv("KEYSTORE_FILE"))
+                      storePassword = System.getenv("KS_PASS")
+                      keyAlias = System.getenv("KS_ALIAS")
+                      keyPassword = System.getenv("KEY_PASS")
+                  }
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("rel")
+                  }
+              }
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                      keepDebugSymbols += "**/*.so"
+                  }
+              }
+              androidResources { noCompress += listOf("zip") }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > $P/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+              <application
+                  android:label="VS Code"
+                  android:icon="@drawable/ic_launcher"
+                  android:allowBackup="false"
+                  android:largeHeap="true"
+                  android:usesCleartextTraffic="true"
+                  android:networkSecurityConfig="@xml/network_security_config"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ServerService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="local-development-server" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/res/xml/network_security_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="false" />
+              <domain-config cleartextTrafficPermitted="true">
+                  <domain includeSubdomains="false">127.0.0.1</domain>
+                  <domain includeSubdomains="false">localhost</domain>
+              </domain-config>
+          </network-security-config>
+          EOF
+
+          cat > $P/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#1F9CF0" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M76,22 L88,28 L88,80 L76,86 L38,52 L24,62 L20,60 L20,48 L24,46 L38,54 L76,22 Z" />
+              <path android:fillColor="#1F9CF0" android:pathData="M76,40 L76,68 L56,54 Z" />
+          </vector>
+          EOF
+
+          cat > $P/java/dev/vscode/android/ServerService.kt <<'EOF'
+          package dev.vscode.android
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import android.system.Os
+          import android.util.Log
+          import java.io.BufferedInputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.security.SecureRandom
+          import java.util.zip.ZipInputStream
+
+          class ServerService : Service() {
+
+              companion object {
+                  const val PORT = 38765
+                  const val TAG = "VSCodeServer"
+                  const val ACTION_STOP = "dev.vscode.android.STOP"
+
+                  @Volatile var state: String = "idle"
+                  @Volatile var message: String = ""
+                  @Volatile var token: String = ""
+
+                  fun isUp(): Boolean = try {
+                      val c = URL("http://127.0.0.1:$PORT/version").openConnection() as HttpURLConnection
+                      c.connectTimeout = 700
+                      c.readTimeout = 700
+                      val ok = c.responseCode == 200
+                      c.disconnect()
+                      ok
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private var proc: java.lang.Process? = null
+              private var worker: Thread? = null
+              @Volatile private var stopping = false
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopping = true
+                      proc?.destroyForcibly()
+                      state = "idle"
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  goForeground()
+                  if (worker?.isAlive != true) {
+                      stopping = false
+                      worker = Thread({
+                          try {
+                              runServer()
+                          } catch (t: Throwable) {
+                              Log.e(TAG, "fatal", t)
+                              state = "failed"
+                              message = t.stackTraceToString().take(4000)
+                          }
+                      }, "vscode-server").also { it.start() }
+                  }
+                  return START_STICKY
+              }
+
+              private fun goForeground() {
+                  try {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(
+                          NotificationChannel("server", "VS Code server", NotificationManager.IMPORTANCE_LOW)
+                      )
+                      val stop = PendingIntent.getService(
+                          this, 0, Intent(this, ServerService::class.java).setAction(ACTION_STOP),
+                          PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val open = PendingIntent.getActivity(
+                          this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val n = Notification.Builder(this, "server")
+                          .setContentTitle("VS Code")
+                          .setContentText("Server lokal berjalan di 127.0.0.1:$PORT")
+                          .setSmallIcon(android.R.drawable.ic_menu_edit)
+                          .setContentIntent(open)
+                          .addAction(Notification.Action.Builder(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stop).build())
+                          .setOngoing(true)
+                          .build()
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                      } else {
+                          startForeground(1, n)
+                      }
+                  } catch (e: Exception) {
+                      Log.w(TAG, "startForeground gagal: $e")
+                  }
+              }
+
+              private fun runServer() {
+                  val nativeDir = applicationInfo.nativeLibraryDir
+                  val node = File(nativeDir, "libvscode_node.so")
+                  if (!node.exists()) throw IllegalStateException("Node runtime tidak ditemukan: $node")
+
+                  val prefs = getSharedPreferences("vscode", MODE_PRIVATE)
+                  var tk = prefs.getString("token", null)
+                  if (tk == null) {
+                      val b = ByteArray(24)
+                      SecureRandom().nextBytes(b)
+                      tk = b.joinToString("") { "%02x".format(it) }
+                      prefs.edit().putString("token", tk).apply()
+                  }
+                  token = tk
+
+                  if (isUp()) {
+                      state = "running"
+                      message = ""
+                      return
+                  }
+
+                  val serverDir = File(filesDir, "server")
+                  val stamp = packageManager.getPackageInfo(packageName, 0).lastUpdateTime.toString()
+                  val marker = File(filesDir, "server.stamp")
+                  if (!serverDir.exists() || !marker.exists() || marker.readText() != stamp) {
+                      extract(serverDir, marker, stamp)
+                  }
+
+                  val home = File(filesDir, "home").apply { mkdirs() }
+                  val tmp = File(cacheDir, "r").apply { mkdirs() }
+                  val ws = File(filesDir, "workspace").apply { mkdirs() }
+                  val data = File(filesDir, "server-data").apply { mkdirs() }
+
+                  // ripgrep: arahkan ke biner Android di nativeLibraryDir
+                  val rgDir = File(serverDir, "node_modules/@vscode/ripgrep/bin").apply { mkdirs() }
+                  val rg = File(rgDir, "rg")
+                  try { rg.delete() } catch (_: Exception) {}
+                  try {
+                      Os.symlink(File(nativeDir, "libvscode_rg.so").path, rg.path)
+                  } catch (e: Exception) {
+                      Log.w(TAG, "symlink rg gagal: $e")
+                  }
+                  try {
+                      val l = File(ws, "sdcard")
+                      if (!l.exists()) Os.symlink("/storage/emulated/0", l.path)
+                  } catch (_: Exception) {}
+
+                  val preload = File(serverDir, "android-preload.js")
+                  val cmd = listOf(
+                      node.path,
+                      File(serverDir, "out/server-main.js").path,
+                      "--host=127.0.0.1",
+                      "--port=$PORT",
+                      "--connection-token=$tk",
+                      "--accept-server-license-terms",
+                      "--telemetry-level=off",
+                      "--server-data-dir=${data.path}",
+                      "--user-data-dir=${File(data, "user").path}",
+                      "--extensions-dir=${File(data, "extensions").path}",
+                      "--default-folder=${ws.path}"
+                  )
+                  val pb = ProcessBuilder(cmd).directory(home).redirectErrorStream(true)
+                  val env = pb.environment()
+                  env["HOME"] = home.path
+                  env["TMPDIR"] = tmp.path
+                  env["XDG_RUNTIME_DIR"] = tmp.path
+                  env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH"]?.let { "$nativeDir:$it" } ?: nativeDir
+                  env["SHELL"] = "/system/bin/sh"
+                  env["PATH"] = "$nativeDir:/system/bin:/system/xbin"
+                  env["LANG"] = "en_US.UTF-8"
+                  env["TERM"] = "xterm-256color"
+                  env["COLORTERM"] = "truecolor"
+                  env["NODE_OPTIONS"] = "--require ${preload.path}"
+
+                  state = "starting"
+                  message = "Menjalankan server…"
+                  val p = pb.start()
+                  proc = p
+
+                  val tail = ArrayDeque<String>()
+                  Thread {
+                      p.inputStream.bufferedReader().forEachLine { l ->
+                          Log.i(TAG, l)
+                          synchronized(tail) {
+                              tail.addLast(l)
+                              if (tail.size > 40) tail.removeFirst()
+                          }
+                      }
+                  }.also { it.isDaemon = true }.start()
+
+                  fun tailText(): String = synchronized(tail) { tail.joinToString("\n") }
+
+                  val t0 = System.currentTimeMillis()
+                  var up = false
+                  while (p.isAlive && System.currentTimeMillis() - t0 < 240_000) {
+                      if (isUp()) { up = true; break }
+                      Thread.sleep(400)
+                  }
+                  if (up) {
+                      state = "running"
+                      message = ""
+                  } else if (p.isAlive) {
+                      state = "failed"
+                      message = "Server tidak merespons dalam 4 menit.\n" + tailText()
+                  }
+                  val code = p.waitFor()
+                  if (!stopping) {
+                      state = "failed"
+                      message = "Server berhenti (exit $code)\n" + tailText()
+                  }
+              }
+
+              private fun extract(dest: File, stampFile: File, stamp: String) {
+                  state = "extracting"
+                  message = "Menyiapkan VS Code (hanya pertama kali, bisa beberapa menit)…"
+                  stampFile.delete()
+                  dest.deleteRecursively()
+                  dest.mkdirs()
+                  val root = dest.canonicalPath + File.separator
+                  var count = 0
+                  ZipInputStream(BufferedInputStream(assets.open("vscode-server.zip"), 1 shl 16)).use { zin ->
+                      val buf = ByteArray(1 shl 16)
+                      while (true) {
+                          val e = zin.nextEntry ?: break
+                          val out = File(dest, e.name)
+                          if (!out.canonicalPath.startsWith(root)) continue
+                          if (e.isDirectory) { out.mkdirs(); continue }
+                          out.parentFile?.mkdirs()
+                          FileOutputStream(out).use { fo ->
+                              while (true) {
+                                  val n = zin.read(buf)
+                                  if (n < 0) break
+                                  fo.write(buf, 0, n)
+                              }
+                          }
+                          count++
+                          if (count % 500 == 0) message = "Mengekstrak… $count berkas"
+                      }
+                  }
+                  stampFile.writeText(stamp)
+              }
+
+              override fun onDestroy() {
+                  stopping = true
+                  proc?.destroyForcibly()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > $P/java/dev/vscode/android/MainActivity.kt <<'EOF'
+          package dev.vscode.android
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.webkit.PermissionRequest
+          import android.webkit.ValueCallback
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var web: WebView
+              private lateinit var panel: LinearLayout
+              private lateinit var info: TextView
+              private lateinit var retry: Button
+              private var loaded = false
+              private var fileCb: ValueCallback<Array<Uri>>? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val poll = object : Runnable {
+                  override fun run() {
+                      tick()
+                      ui.postDelayed(this, 500)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = Color.parseColor("#1e1e1e")
+                  window.navigationBarColor = Color.parseColor("#1e1e1e")
+
+                  val root = FrameLayout(this)
+                  root.setBackgroundColor(Color.parseColor("#1e1e1e"))
+
+                  WebView.setWebContentsDebuggingEnabled(true)
+                  web = WebView(this)
+                  web.setBackgroundColor(Color.parseColor("#1e1e1e"))
+                  web.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      @Suppress("DEPRECATION")
+                      databaseEnabled = true
+                      mediaPlaybackRequiresUserGesture = false
+                      allowFileAccess = false
+                      allowContentAccess = false
+                      javaScriptCanOpenWindowsAutomatically = true
+                      setSupportZoom(false)
+                  }
+                  web.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          val u = request.url
+                          if (u.host == "127.0.0.1" || u.host == "localhost") return false
+                          try { startActivity(Intent(Intent.ACTION_VIEW, u)) } catch (_: Exception) {}
+                          return true
+                      }
+                  }
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onPermissionRequest(request: PermissionRequest) {
+                          runOnUiThread {
+                              if (request.origin.host == "127.0.0.1") request.grant(request.resources) else request.deny()
+                          }
+                      }
+
+                      override fun onShowFileChooser(
+                          view: WebView,
+                          callback: ValueCallback<Array<Uri>>,
+                          params: FileChooserParams
+                      ): Boolean {
+                          fileCb?.onReceiveValue(null)
+                          fileCb = callback
+                          return try {
+                              @Suppress("DEPRECATION")
+                              startActivityForResult(params.createIntent(), 42)
+                              true
+                          } catch (e: Exception) {
+                              fileCb = null
+                              false
+                          }
+                      }
+                  }
+                  root.addView(web, FrameLayout.LayoutParams(-1, -1))
+
+                  panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#1e1e1e"))
+                      setPadding(48, 48, 48, 48)
+                  }
+                  info = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      text = "Memulai…"
+                  }
+                  val sv = ScrollView(this)
+                  sv.addView(info)
+                  retry = Button(this).apply {
+                      text = "Coba lagi"
+                      visibility = View.GONE
+                      setOnClickListener {
+                          ServerService.state = "starting"
+                          startForegroundService(Intent(this@MainActivity, ServerService::class.java))
+                      }
+                  }
+                  panel.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
+                  panel.addView(retry, LinearLayout.LayoutParams(-2, -2))
+                  root.addView(panel, FrameLayout.LayoutParams(-1, -1))
+                  setContentView(root)
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  val prefs = getSharedPreferences("vscode", MODE_PRIVATE)
+                  if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager() &&
+                      !prefs.getBoolean("asked_storage", false)
+                  ) {
+                      prefs.edit().putBoolean("asked_storage", true).apply()
+                      try {
+                          startActivity(
+                              Intent(
+                                  Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                  Uri.parse("package:$packageName")
+                              )
+                          )
+                      } catch (_: Exception) {}
+                  }
+                  startForegroundService(Intent(this, ServerService::class.java))
+              }
+
+              private fun tick() {
+                  when (ServerService.state) {
+                      "running" -> {
+                          panel.visibility = View.GONE
+                          if (!loaded) {
+                              loaded = true
+                              web.loadUrl("http://127.0.0.1:${ServerService.PORT}/?tkn=${ServerService.token}")
+                          }
+                      }
+                      "failed" -> {
+                          loaded = false
+                          info.text = ServerService.message
+                          retry.visibility = View.VISIBLE
+                          panel.visibility = View.VISIBLE
+                      }
+                      else -> {
+                          loaded = false
+                          info.text = ServerService.message.ifEmpty { "Memulai…" }
+                          retry.visibility = View.GONE
+                          panel.visibility = View.VISIBLE
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  ui.post(poll)
+              }
+
+              override fun onPause() {
+                  ui.removeCallbacks(poll)
+                  super.onPause()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (requestCode == 42) {
+                      fileCb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+                      fileCb = null
+                  } else {
+                      @Suppress("DEPRECATION")
+                      super.onActivityResult(requestCode, resultCode, data)
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  moveTaskToBack(true)
+              }
+
+              override fun onDestroy() {
+                  ui.removeCallbacks(poll)
+                  web.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KS="$PWD/apk/ks.jks"
+          PASS='${{ secrets.KEYSTORE_PASSWORD }}'; PASS="${PASS:-android123}"
+          ALIAS='${{ secrets.KEY_ALIAS }}';        ALIAS="${ALIAS:-vscode}"
+          KPASS='${{ secrets.KEY_PASSWORD }}';     KPASS="${KPASS:-$PASS}"
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+          else
+            echo "::notice::Secret KEYSTORE_BASE64 tidak ada -> memakai keystore sementara (update APK antar-build butuh keystore tetap)"
+            keytool -genkeypair -keystore "$KS" -storepass "$PASS" -keypass "$KPASS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=VSCode Android"
+          fi
+          {
+            echo "KEYSTORE_FILE=$KS"
+            echo "KS_PASS=$PASS"
+            echo "KS_ALIAS=$ALIAS"
+            echo "KEY_PASS=$KPASS"
+          } >> "$GITHUB_ENV"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build APK
+        working-directory: apk
+        env:
+          APP_VERSION: ${{ needs.server.outputs.version }}
+          APP_VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon --stacktrace assembleRelease
+
+      - name: Rapikan nama APK
+        run: |
+          set -euo pipefail
+          APK="apk/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK"
+          cp "$APK" "vscode-android-${{ needs.server.outputs.version }}-arm64.apk"
+          ls -lh vscode-android-*.apk
+          {
+            echo "### VS Code Android APK"
+            echo "- VS Code: \`${{ needs.runtime.outputs.vscode_ref }}\` (versi ${{ needs.server.outputs.version }})"
+            echo "- ABI: arm64-v8a, minSdk 26 (Android 8.0+)"
+            echo "- Cek log job **server** untuk peringatan rebuild native module (terminal/watcher)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode-android-apk
+          path: vscode-android-*.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vscode-android-${{ needs.server.outputs.version }}-${{ github.run_number }}
+          name: VS Code Android ${{ needs.server.outputs.version }}
+          files: vscode-android-*.apk
