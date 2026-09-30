@@ -8,7 +8,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Flutter 3.27.4 → Dart 3.6.x, memenuhi syarat flutter_lints ^5.0.0
   FLUTTER_VERSION: '3.27.4'
   JAVA_VERSION: '17'
   CODE_SERVER_VERSION: '4.103.1'
@@ -22,54 +21,39 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # ── 1. Checkout repositori workflow ─────────────────────────────
       - name: Checkout workflow repository
         uses: actions/checkout@v4
         with:
           path: workflow-repo
 
-      # ── 2. Clone Code FA ────────────────────────────────────────────
-      - name: Clone Code FA (Flutter project)
+      - name: Clone Code FA
         run: |
           git clone --depth 1 ${{ env.CODE_LFA_REPO }} code_lfa
           cd code_lfa
-          echo "=== Cek pubspec.yaml ==="
-          test -f pubspec.yaml && echo "OK: pubspec.yaml ditemukan" || { echo "FATAL: pubspec.yaml tidak ada"; exit 1; }
-          echo "=== Cek environment SDK di pubspec.yaml ==="
-          grep -A2 'environment:' pubspec.yaml || true
+          test -f pubspec.yaml || { echo "FATAL: pubspec.yaml tidak ada"; exit 1; }
+          echo "OK: proyek Code FA ter-clone"
+          ls -la
 
-      # ── 3. Setup Java ───────────────────────────────────────────────
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
-      # ── 4. Setup Flutter (versi yang benar) ──────────────────────────
-      - name: Setup Flutter ${{ env.FLUTTER_VERSION }}
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
 
-      # ── 5. Verifikasi versi Flutter & Dart ──────────────────────────
-      - name: Verify Flutter and Dart versions
+      - name: Verify Flutter and Dart
         run: |
           flutter --version
-          echo "=== Dart SDK version ==="
           dart --version
-          echo "=== Memastikan Dart >= 3.5.0 ==="
-          DART_VER=$(dart --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
-          echo "Dart version terdeteksi: $DART_VER"
-          MAJOR=$(echo $DART_VER | cut -d. -f1)
-          MINOR=$(echo $DART_VER | cut -d. -f2)
-          if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 5 ]; }; then
-            echo "FATAL: Dart $DART_VER terlalu lama, minimal 3.5.0"; exit 1
-          fi
-          echo "OK: Dart $DART_VER memenuhi syarat"
+          flutter config --no-analytics
+          flutter config --no-cli-animations
 
-      # ── 6. Setup Android SDK (tanpa paket 'tools' usang) ────────────
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -77,96 +61,107 @@ jobs:
           accept-android-sdk-licenses: true
           packages: ''
 
-      # ── 7. Terima lisensi & instal paket SDK ────────────────────────
       - name: Accept Android SDK Licenses
         run: yes | sdkmanager --licenses || true
 
       - name: Install Android SDK Packages
         run: |
           set -e
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.ANDROID_NDK_VERSION }}" || {
-            echo "WARN: sdkmanager gagal, coba fallback tanpa NDK...";
-            sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" || true;
-          }
-          # Set env NDK jika folder ada
-          NDK_DIR="$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}"
-          if [ -d "$NDK_DIR" ]; then
-            echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
-            echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
-          else
-            echo "WARN: NDK tidak ditemukan di $NDK_DIR, melanjutkan tanpa NDK"
-          fi
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
-      # ── 8. Bersihkan proyek dari file override usang ────────────────
-      - name: Clean stale override files
+      - name: Clean stale files
+        working-directory: code_lfa
+        run: |
+          rm -f pubspec.lock pubspec_overrides.yaml .packages .flutter-plugins .flutter-plugins-dependencies
+          rm -rf .dart_tool build
+          echo "OK: file usang dibersihkan"
+
+      - name: Flutter pub get
         working-directory: code_lfa
         run: |
           set -e
-          echo "=== Menghapus file usang yang berisi path absolut ==="
-          rm -f pubspec.lock pubspec_overrides.yaml .packages .flutter-plugins .flutter-plugins-dependencies || true
-          rm -rf .dart_tool build || true
-          echo "=== File yang tersisa di root ==="
-          ls -la | head -30
+          flutter clean
+          flutter pub get
+          test -f .dart_tool/package_config.json || { echo "FATAL: package_config.json tidak dibuat"; exit 1; }
+          echo "OK: dependensi ter-resolve"
 
-      # ── 9. Flutter clean & pub get dengan fallback ──────────────────
-      - name: Flutter clean and pub get
-        working-directory: code_lfa
-        run: |
-          set -e
-          flutter config --no-analytics || true
-          flutter config --no-cli-animations || true
-
-          echo "=== flutter clean ==="
-          flutter clean || true
-
-          echo "=== flutter pub get (percobaan 1) ==="
-          if flutter pub get; then
-            echo "OK: pub get berhasil pada percobaan pertama"
-          else
-            echo "WARN: pub get gagal, mencoba fallback..."
-            # Fallback 1: hapus lagi override & lock
-            rm -f pubspec.lock pubspec_overrides.yaml || true
-            # Fallback 2: upgrade dependensi yang bermasalah
-            flutter pub upgrade --major-versions || true
-            # Fallback 3: coba lagi
-            flutter pub get || {
-              echo "WARN: masih gagal, mencoba dengan --no-example...";
-              flutter pub get --no-example || true;
-            }
-          fi
-
-          echo "=== Verifikasi .dart_tool/package_config.json ==="
-          test -f .dart_tool/package_config.json && echo "OK: package_config.json ada" || echo "WARN: package_config.json tidak ada"
-
-      # ── 10. Unduh code-server ───────────────────────────────────────
       - name: Download code-server
         working-directory: code_lfa
         run: |
+          set -e
           mkdir -p assets/code-server
-          URL="https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
-          echo "Mengunduh: $URL"
-          curl -L --retry 3 --retry-delay 5 -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz "$URL" || {
-            echo "WARN: gagal unduh code-server, mencoba versi alternatif...";
-            curl -L --retry 3 -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
-              "https://github.com/coder/code-server/releases/download/v4.96.2/code-server-4.96.2-linux-arm64.tar.gz" || true;
-          }
+          curl -fL --retry 3 --retry-delay 5 \
+            -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
+            "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
           ls -la assets/code-server/
+          test -s assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz || { echo "FATAL: code-server tidak terunduh"; exit 1; }
+          echo "OK: code-server terunduh"
 
-      # ── 11. Build APK ───────────────────────────────────────────────
-      - name: Build APK (release)
+      # ── BUILD: coba beberapa varian, tapi jangan telan error ──
+      - name: Build APK (release, split-per-abi)
+        id: build_release
+        working-directory: code_lfa
+        continue-on-error: true
+        run: flutter build apk --release --split-per-abi
+
+      - name: Build APK (release, universal) - fallback 1
+        id: build_universal
+        if: steps.build_release.outcome == 'failure'
+        working-directory: code_lfa
+        continue-on-error: true
+        run: |
+          echo "Release split gagal, coba universal..."
+          flutter build apk --release
+
+      - name: Build APK (debug) - fallback 2
+        id: build_debug
+        if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure'
+        working-directory: code_lfa
+        continue-on-error: true
+        run: |
+          echo "Release universal gagal, coba debug..."
+          flutter build apk --debug
+
+      # ── DIAGNOSTIK: kalau semua gagal, cetak log lengkap ──
+      - name: Diagnose build failure
+        if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure' && steps.build_debug.outcome == 'failure'
         working-directory: code_lfa
         run: |
-          set -e
-          flutter build apk --release --split-per-abi || {
-            echo "WARN: build release gagal, mencoba build debug...";
-            flutter build apk --debug || {
-              echo "WARN: build debug gagal juga, mencoba tanpa split-per-abi...";
-              flutter build apk --release || true;
-            }
-          }
+          echo "=========================================="
+          echo "SEMUA BUILD GAGAL - MENAMPILKAN DIAGNOSTIK"
+          echo "=========================================="
+          echo "--- flutter doctor -v ---"
+          flutter doctor -v || true
+          echo "--- flutter pub deps (ringkas) ---"
+          flutter pub deps --style=compact 2>&1 | head -50 || true
+          echo "--- Android SDK ---"
+          ls -la $ANDROID_HOME/ || true
+          echo "--- NDK ---"
+          ls -la $ANDROID_HOME/ndk/ || true
+          echo "--- Struktur folder build ---"
+          find build -maxdepth 4 -type d 2>/dev/null || echo "Tidak ada folder build/"
+          echo "--- File APK yang ada (jika ada) ---"
+          find build -name "*.apk" 2>/dev/null || echo "Tidak ada APK"
 
-      # ── 12. Upload APK ──────────────────────────────────────────────
+      # ── VERIFIKASI: pastikan APK benar-benar ada ──
+      - name: Verify APK exists
+        id: verify_apk
+        working-directory: code_lfa
+        run: |
+          echo "=== Mencari file APK ==="
+          APK_COUNT=$(find build/app/outputs -name "*.apk" 2>/dev/null | wc -l)
+          echo "Jumlah APK ditemukan: $APK_COUNT"
+          find build/app/outputs -name "*.apk" -exec ls -lh {} \; 2>/dev/null || true
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "FATAL: Tidak ada APK yang dihasilkan. Build gagal."
+            exit 1
+          fi
+          echo "OK: APK ditemukan"
+
       - name: Upload APK artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vscode-android-apk
@@ -174,4 +169,15 @@ jobs:
             code_lfa/build/app/outputs/flutter-apk/*.apk
             code_lfa/build/app/outputs/apk/**/*.apk
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
+
+      - name: Upload build logs (jika gagal)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            code_lfa/android/.gradle/**
+            code_lfa/build/**
+          retention-days: 7
+          if-no-files-found: ignore
