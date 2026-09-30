@@ -1,0 +1,89 @@
+name: Build VS Code Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: '3.19.0'
+  JAVA_VERSION: '17'
+  CODE_SERVER_VERSION: '4.103.1'
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup Java
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 3. Setup Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      # 4. Setup Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          accept-android-sdk-licenses: true
+
+      # 5. Install Android NDK
+      - name: Install Android NDK
+        run: |
+          echo "y" | sdkmanager --install "ndk;25.1.8937393"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.1.8937393" >> $GITHUB_ENV
+
+      # 6. Download code-server
+      - name: Download code-server
+        run: |
+          mkdir -p assets/code-server
+          curl -L -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
+            "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
+          ls -la assets/code-server/
+
+      # 7. Install Flutter dependencies
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      # 8. Build APK (release)
+      - name: Build APK (release)
+        run: flutter build apk --release --split-per-abi
+
+      # 9. Upload APK artifacts
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-android-apk
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 30
+
+      # 10. Build APK (debug) - opsional
+      - name: Build APK (debug)
+        if: github.event_name == 'pull_request'
+        run: flutter build apk --debug
+
+      - name: Upload Debug APK
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-android-apk-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 7
