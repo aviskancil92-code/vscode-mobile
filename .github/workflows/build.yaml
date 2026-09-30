@@ -12,23 +12,39 @@ env:
   JAVA_VERSION: '17'
   CODE_SERVER_VERSION: '4.103.1'
   ANDROID_NDK_VERSION: '25.1.8937393'
+  CODE_LFA_REPO: 'https://github.com/nightmare-space/code_lfa.git'
 
 jobs:
   build:
     name: Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout repository
+      # 1. Checkout repo workflow (bisa repo kosong)
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
+        with:
+          path: workflow-repo
 
+      # 2. Clone proyek Flutter Code FA
+      - name: Clone Code FA (Flutter project)
+        run: |
+          git clone --depth 1 ${{ env.CODE_LFA_REPO }} code_lfa
+          cd code_lfa
+          echo "=== Struktur proyek ==="
+          ls -la
+          echo "=== Cek pubspec.yaml ==="
+          test -f pubspec.yaml && echo "pubspec.yaml DITEMUKAN" || (echo "pubspec.yaml TIDAK ADA" && exit 1)
+
+      # 3. Setup Java
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
+      # 4. Setup Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -36,41 +52,50 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # PERBAIKAN: Kosongkan 'packages' agar tidak menginstal 'tools' yang sudah dihapus
+      # 5. Setup Android SDK (tanpa paket 'tools' usang)
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '11076708'
           accept-android-sdk-licenses: true
-          packages: ''   # <-- KUNCI PERBAIKAN
+          packages: ''
 
-      # Terima semua lisensi secara eksplisit
+      # 6. Terima lisensi & instal paket yang benar
       - name: Accept Android SDK Licenses
         run: yes | sdkmanager --licenses || true
 
-      # Instal paket yang benar secara manual
       - name: Install Android SDK Packages
         run: |
-          sdkmanager --install "platform-tools" "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;${{ env.ANDROID_NDK_VERSION }}"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
+      # 7. Install Flutter dependencies DI DALAM folder code_lfa
+      - name: Install Flutter dependencies
+        working-directory: code_lfa
+        run: |
+          flutter --version
+          flutter config --no-analytics
+          flutter pub get
+
+      # 8. Download code-server dan letakkan di folder assets
       - name: Download code-server
+        working-directory: code_lfa
         run: |
           mkdir -p assets/code-server
           curl -L -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
             "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
           ls -la assets/code-server/
 
-      - name: Install Flutter dependencies
-        run: flutter pub get
-
+      # 9. Build APK release
       - name: Build APK (release)
+        working-directory: code_lfa
         run: flutter build apk --release --split-per-abi
 
+      # 10. Upload APK
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vscode-android-apk
-          path: build/app/outputs/flutter-apk/*.apk
+          path: code_lfa/build/app/outputs/flutter-apk/*.apk
           retention-days: 30
