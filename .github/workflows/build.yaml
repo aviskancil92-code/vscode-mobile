@@ -32,7 +32,6 @@ jobs:
           cd code_lfa
           test -f pubspec.yaml || { echo "FATAL: pubspec.yaml tidak ada"; exit 1; }
           echo "OK: proyek Code FA ter-clone"
-          ls -la
 
       - name: Setup Java JDK
         uses: actions/setup-java@v4
@@ -78,6 +77,20 @@ jobs:
           rm -rf .dart_tool build
           echo "OK: file usang dibersihkan"
 
+      # ── PERBAIKAN UTAMA: paksa path ke 1.9.0 ───────────────────────
+      - name: Patch pubspec.yaml to override path version
+        working-directory: code_lfa
+        run: |
+          echo "=== Sebelum patch: cek dependency_overrides ==="
+          grep -n "dependency_overrides" pubspec.yaml || echo "Tidak ada dependency_overrides"
+          echo "=== Menambahkan dependency_overrides: path: 1.9.0 ==="
+          # Hapus dependency_overrides lama jika ada (untuk aman)
+          sed -i '/^dependency_overrides:/,/^[^ ]/d' pubspec.yaml || true
+          # Tambahkan di akhir file
+          printf "\ndependency_overrides:\n  path: 1.9.0\n" >> pubspec.yaml
+          echo "=== Sesudah patch ==="
+          tail -20 pubspec.yaml
+
       - name: Flutter pub get
         working-directory: code_lfa
         run: |
@@ -95,18 +108,16 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 \
             -o assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz \
             "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
-          ls -la assets/code-server/
           test -s assets/code-server/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz || { echo "FATAL: code-server tidak terunduh"; exit 1; }
           echo "OK: code-server terunduh"
 
-      # ── BUILD: coba beberapa varian, tapi jangan telan error ──
       - name: Build APK (release, split-per-abi)
         id: build_release
         working-directory: code_lfa
         continue-on-error: true
         run: flutter build apk --release --split-per-abi
 
-      - name: Build APK (release, universal) - fallback 1
+      - name: Build APK (release, universal) - fallback
         id: build_universal
         if: steps.build_release.outcome == 'failure'
         working-directory: code_lfa
@@ -115,7 +126,7 @@ jobs:
           echo "Release split gagal, coba universal..."
           flutter build apk --release
 
-      - name: Build APK (debug) - fallback 2
+      - name: Build APK (debug) - fallback
         id: build_debug
         if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure'
         working-directory: code_lfa
@@ -124,38 +135,31 @@ jobs:
           echo "Release universal gagal, coba debug..."
           flutter build apk --debug
 
-      # ── DIAGNOSTIK: kalau semua gagal, cetak log lengkap ──
       - name: Diagnose build failure
         if: steps.build_release.outcome == 'failure' && steps.build_universal.outcome == 'failure' && steps.build_debug.outcome == 'failure'
         working-directory: code_lfa
         run: |
           echo "=========================================="
-          echo "SEMUA BUILD GAGAL - MENAMPILKAN DIAGNOSTIK"
+          echo "SEMUA BUILD GAGAL - DIAGNOSTIK"
           echo "=========================================="
-          echo "--- flutter doctor -v ---"
           flutter doctor -v || true
-          echo "--- flutter pub deps (ringkas) ---"
-          flutter pub deps --style=compact 2>&1 | head -50 || true
+          echo "--- pubspec.yaml (tail) ---"
+          tail -30 pubspec.yaml || true
           echo "--- Android SDK ---"
           ls -la $ANDROID_HOME/ || true
-          echo "--- NDK ---"
-          ls -la $ANDROID_HOME/ndk/ || true
           echo "--- Struktur folder build ---"
           find build -maxdepth 4 -type d 2>/dev/null || echo "Tidak ada folder build/"
-          echo "--- File APK yang ada (jika ada) ---"
+          echo "--- File APK ---"
           find build -name "*.apk" 2>/dev/null || echo "Tidak ada APK"
 
-      # ── VERIFIKASI: pastikan APK benar-benar ada ──
       - name: Verify APK exists
-        id: verify_apk
         working-directory: code_lfa
         run: |
-          echo "=== Mencari file APK ==="
           APK_COUNT=$(find build/app/outputs -name "*.apk" 2>/dev/null | wc -l)
           echo "Jumlah APK ditemukan: $APK_COUNT"
           find build/app/outputs -name "*.apk" -exec ls -lh {} \; 2>/dev/null || true
           if [ "$APK_COUNT" -eq 0 ]; then
-            echo "FATAL: Tidak ada APK yang dihasilkan. Build gagal."
+            echo "FATAL: Tidak ada APK yang dihasilkan."
             exit 1
           fi
           echo "OK: APK ditemukan"
