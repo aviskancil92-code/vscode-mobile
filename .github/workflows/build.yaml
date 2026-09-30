@@ -70,12 +70,15 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
-      # 7. Install Flutter dependencies DI DALAM folder code_lfa
-      - name: Install Flutter dependencies
+      # 7. HAPUS FILE LOCK USANG & INSTAL DEPENDENSI FLUTTER
+      - name: Clean Flutter project and install dependencies
         working-directory: code_lfa
         run: |
-          flutter --version
+          echo "=== Menghapus pubspec.lock dan cache usang ==="
+          rm -f pubspec.lock .packages .flutter-plugins .flutter-plugins-dependencies
+          flutter clean
           flutter config --no-analytics
+          echo "=== Menjalankan flutter pub get ==="
           flutter pub get
 
       # 8. Download code-server dan letakkan di folder assets
