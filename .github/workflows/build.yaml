@@ -11,6 +11,7 @@ env:
   FLUTTER_VERSION: '3.19.0'
   JAVA_VERSION: '17'
   CODE_SERVER_VERSION: '4.103.1'
+  ANDROID_NDK_VERSION: '25.1.8937393'
 
 jobs:
   build:
@@ -19,18 +20,15 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Setup Java
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
-      # 3. Setup Flutter
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -38,20 +36,25 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # 4. Setup Android SDK
+      # PERBAIKAN: Kosongkan 'packages' agar tidak menginstal 'tools' yang sudah dihapus
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '11076708'
           accept-android-sdk-licenses: true
+          packages: ''   # <-- KUNCI PERBAIKAN
 
-      # 5. Install Android NDK
-      - name: Install Android NDK
+      # Terima semua lisensi secara eksplisit
+      - name: Accept Android SDK Licenses
+        run: yes | sdkmanager --licenses || true
+
+      # Instal paket yang benar secara manual
+      - name: Install Android SDK Packages
         run: |
-          echo "y" | sdkmanager --install "ndk;25.1.8937393"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.1.8937393" >> $GITHUB_ENV
+          sdkmanager --install "platform-tools" "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> $GITHUB_ENV
 
-      # 6. Download code-server
       - name: Download code-server
         run: |
           mkdir -p assets/code-server
@@ -59,31 +62,15 @@ jobs:
             "https://github.com/coder/code-server/releases/download/v${{ env.CODE_SERVER_VERSION }}/code-server-${{ env.CODE_SERVER_VERSION }}-linux-arm64.tar.gz"
           ls -la assets/code-server/
 
-      # 7. Install Flutter dependencies
       - name: Install Flutter dependencies
         run: flutter pub get
 
-      # 8. Build APK (release)
       - name: Build APK (release)
         run: flutter build apk --release --split-per-abi
 
-      # 9. Upload APK artifacts
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vscode-android-apk
           path: build/app/outputs/flutter-apk/*.apk
           retention-days: 30
-
-      # 10. Build APK (debug) - opsional
-      - name: Build APK (debug)
-        if: github.event_name == 'pull_request'
-        run: flutter build apk --debug
-
-      - name: Upload Debug APK
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: vscode-android-apk-debug
-          path: build/app/outputs/flutter-apk/app-debug.apk
-          retention-days: 7
